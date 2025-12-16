@@ -1,123 +1,175 @@
-from pydantic import BaseModel
+from llama_index.core.bridge.pydantic import BaseModel
 import qdrant_client
 from llama_index.vector_stores.qdrant import QdrantVectorStore
-from llama_index.embeddings import OpenAIEmbedding
-from llama_index.llms import OpenAI
-from llama_index.schema import Document
-from llama_index import (
-    VectorStoreIndex,
-    ServiceContext,
-)
+from llama_index.embeddings.openai import OpenAIEmbedding
+from llama_index.llms.openai import OpenAI
+from llama_index.core.schema import Document
+from llama_index.core import VectorStoreIndex, Settings
+from llama_index.core.node_parser import SentenceWindowNodeParser
+from llama_index.core.query_engine import CitationQueryEngine
 from dataclasses import dataclass
 import os
+from app.pdf_reader import PDFPlumberExtractor
+from app.pdf_parser import CustomPDFParser
+from dotenv import load_dotenv
 
-key = os.environ['OPENAI_API_KEY']
+load_dotenv()
+
+key = os.environ["OPENAI_API_KEY"]
+_PROJECT_ROOT = os.environ.get("PROJECT_ROOT")
+DEFAULT_PDF_PATH = os.path.join(_PROJECT_ROOT, "docs", "laws.pdf")
+
 
 @dataclass
 class Input:
     query: str
     file_path: str
 
+
 @dataclass
 class Citation:
     source: str
     text: str
+
 
 class Output(BaseModel):
     query: str
     response: str
     citations: list[Citation]
 
+
 class DocumentService:
+    def __init__(self, pdf_path: str = DEFAULT_PDF_PATH):
+        self.pdf_reader = PDFPlumberExtractor(pdf_path)
 
-    """
-    Update this service to load the pdf and extract its contents.
-    The example code below will help with the data structured required
-    when using the QdrantService.load() method below. Note: for this
-    exercise, ignore the subtle difference between llama-index's 
-    Document and Node classes (i.e, treat them as interchangeable).
+    def nodes_to_documents(self, nodes, path=None) -> list[Document]:
+        docs = []
+        path = path or []
 
-    # example code
-    def create_documents() -> list[Document]:
+        for node in nodes:
+            new_path = path + [node.title]
 
-        docs = [
-            Document(
-                metadata={"Section": "Law 1"},
-                text="Theft is punishable by hanging",
-            ),
-            Document(
-                metadata={"Section": "Law 2"},
-                text="Tax evasion is punishable by banishment.",
-            ),
-        ]
+            section_text = node.title
+            if node.content:
+                section_text += "\n" + "\n".join(node.content)
+
+            doc = Document(
+                text=section_text,
+                metadata={
+                    "section": node.title,
+                    "path": new_path,
+                    "depth": node.depth,
+                },
+            )
+            docs.append(doc)
+
+            if node.children:
+                docs.extend(self.nodes_to_documents(node.children, new_path))
 
         return docs
 
-     """
+    def create_documents(self) -> list[Document]:
+        raw_text = self.pdf_reader.extract_text()
+        parser = CustomPDFParser(raw_text)
+        nodes = parser.parse()
+        return self.nodes_to_documents(nodes)
+
+
+def clean_section_title(meta: dict) -> str:
+    section = (meta.get("section") or "").strip().rstrip(".")
+
+    # If it’s a decent label, use it
+    if len(section) > 3:
+        return section
+
+    # Otherwise fall back to last item in path
+    path = meta.get("path") or []
+    if path:
+        fallback = str(path[-1]).strip()
+        if len(fallback) > 2:
+            return fallback
+
+    return "Unknown Section"
+
 
 class QdrantService:
-    def __init__(self, k: int = 2):
+    def __init__(self, k: int = 5):
         self.index = None
         self.k = k
-    
+
     def connect(self) -> None:
-        client = qdrant_client.QdrantClient(location=":memory:")
-                
-        vstore = QdrantVectorStore(client=client, collection_name='temp')
+        # KEEP IN-MEMORY — as requested
+        client = qdrant_client.QdrantClient(path=":memory:")
+        vstore = QdrantVectorStore(client=client, collection_name="temp")
 
-        service_context = ServiceContext.from_defaults(
-            embed_model=OpenAIEmbedding(),
-            llm=OpenAI(api_key=key, model="gpt-4")
-            )
+        Settings.embed_model = OpenAIEmbedding(api_key=key)
+        Settings.llm = OpenAI(api_key=key, model="gpt-4")
 
-        self.index = VectorStoreIndex.from_vector_store(
-            vector_store=vstore, 
-            service_context=service_context
-            )
+        self.index = VectorStoreIndex.from_vector_store(vstore)
 
-    def load(self, docs = list[Document]):
-        self.index.insert_nodes(docs)
-    
+    def load(self, docs: list[Document]) -> None:
+        if self.index is None:
+            raise RuntimeError("Call connect() before load().")
+
+        parser = SentenceWindowNodeParser.from_defaults(
+            window_size=5,  # richer chunk context
+        )
+
+        nodes = parser.get_nodes_from_documents(docs)
+        self.index.insert_nodes(nodes)
+
     def query(self, query_str: str) -> Output:
+        if self.index is None:
+            raise RuntimeError("Call connect() before query().")
 
-        """
-        This method needs to initialize the query engine, run the query, and return
-        the result as a pydantic Output class. This is what will be returned as
-        JSON via the FastAPI endpount. Fee free to do this however you'd like, but
-        a its worth noting that the llama-index package has a CitationQueryEngine...
-
-        Also, be sure to make use of self.k (the number of vectors to return based
-        on semantic similarity).
-
-        # Example output object
-        citations = [
-            Citation(source="Law 1", text="Theft is punishable by hanging"),
-            Citation(source="Law 2", text="Tax evasion is punishable by banishment."),
-        ]
-
-        output = Output(
-            query=query_str, 
-            response=response_text, 
-            citations=citations
+        try:
+            query_engine = CitationQueryEngine.from_args(
+                self.index,
+                similarity_top_k=self.k,
+                citation_chunk_size=200,
             )
-        
-        return output
 
-        """
-       
+            response = query_engine.query(query_str)
+
+            citations = []
+            if hasattr(response, "source_nodes") and response.source_nodes:
+                for node in response.source_nodes:
+                    label = clean_section_title(node.metadata or {})
+
+                    snippet = (
+                        node.text[:200] + "..." if len(node.text) > 200 else node.text
+                    )
+
+                    citations.append(Citation(source=label, text=snippet))
+
+            return Output(
+                query=query_str,
+                response=str(response.response),
+                citations=citations,
+            )
+
+        except Exception as e:
+            return Output(
+                query=query_str,
+                response=f"Error processing query: {str(e)}",
+                citations=[],
+            )
+
 
 if __name__ == "__main__":
-    # Example workflow
-    doc_serivce = DocumentService() # implemented
-    docs = doc_serivce.create_documents() # NOT implemented
+    doc_service = DocumentService()
+    docs = doc_service.create_documents()
+    print(f"Created {len(docs)} docs.")
 
-    index = QdrantService() # implemented
-    index.connect() # implemented
-    index.load() # implemented
+    index = QdrantService()
+    print("Connecting…")
+    index.connect()
+    print("Connected.")
 
-    index.query("what happens if I steal?") # NOT implemented
+    print("Loading documents…")
+    index.load(docs)
+    print("Loaded.")
 
-
-
-
-
+    result = index.query("what happens if I steal?")
+    print(result)
+    input("wait")
